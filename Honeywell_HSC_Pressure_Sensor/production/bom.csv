@@ -1,5 +1,5 @@
 ﻿Designator,Footprint,Quantity,Value,LCSC Part #
 C1,0603,1,0.1uF,
 J1,Molex_PicoBlade_53048-0410_1x04_P1.25mm_Horizontal,1,Conn_01x04,
-"R1, R2",0603,2,4.7k,
+"R1, R2",0603,2,10k,
 SENSOR,Honeywell_HSC_SMT,1,Honeywell_HSC_SMT,

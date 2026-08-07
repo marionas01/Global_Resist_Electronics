@@ -1,12 +1,12 @@
-%TF.GenerationSoftware,KiCad,Pcbnew,10.0.1*%
-%TF.CreationDate,2026-08-06T17:23:21+02:00*%
+%TF.GenerationSoftware,KiCad,Pcbnew,10.0.5*%
+%TF.CreationDate,2026-08-07T13:29:25+02:00*%
 %TF.ProjectId,Honeywell_HSC_SMT,486f6e65-7977-4656-9c6c-5f4853435f53,Mario Wilhelm*%
 %TF.SameCoordinates,Original*%
 %TF.FileFunction,Copper,L2,Bot*%
 %TF.FilePolarity,Positive*%
 %FSLAX46Y46*%
 G04 Gerber Fmt 4.6, Leading zero omitted, Abs format (unit mm)*
-G04 Created by KiCad (PCBNEW 10.0.1) date 2026-08-06 17:23:21*
+G04 Created by KiCad (PCBNEW 10.0.5) date 2026-08-07 13:29:25*
 %MOMM*%
 %LPD*%
 G01*
@@ -30,10 +30,10 @@ G04 Aperture macros list*
 20,1,$1+$1,$8,$9,$2,$3,0*%
 G04 Aperture macros list end*
 %TA.AperFunction,ComponentPad*%
-%ADD10O,0.800000X1.300000*%
+%ADD10RoundRect,0.200000X-0.200000X-0.450000X0.200000X-0.450000X0.200000X0.450000X-0.200000X0.450000X0*%
 %TD*%
 %TA.AperFunction,ComponentPad*%
-%ADD11RoundRect,0.200000X-0.200000X-0.450000X0.200000X-0.450000X0.200000X0.450000X-0.200000X0.450000X0*%
+%ADD11O,0.800000X1.300000*%
 %TD*%
 %TA.AperFunction,ViaPad*%
 %ADD12C,0.800000*%
@@ -43,19 +43,19 @@ G04 Aperture macros list end*
 %TD*%
 G04 APERTURE END LIST*
 D10*
-%TO.P,J1,4,Pin_4_4*%
-%TO.N,/SCL*%
-X23875000Y-29050000D03*
-%TO.P,J1,3,Pin_3_3*%
-%TO.N,/SDA*%
-X22625000Y-29050000D03*
-%TO.P,J1,2,Pin_2_2*%
-%TO.N,/VDD*%
-X21375000Y-29050000D03*
-D11*
 %TO.P,J1,1,Pin_1_1*%
 %TO.N,/GND*%
 X20125000Y-29050000D03*
+D11*
+%TO.P,J1,2,Pin_2_2*%
+%TO.N,/VDD*%
+X21375000Y-29050000D03*
+%TO.P,J1,3,Pin_3_3*%
+%TO.N,/SDA*%
+X22625000Y-29050000D03*
+%TO.P,J1,4,Pin_4_4*%
+%TO.N,/SCL*%
+X23875000Y-29050000D03*
 %TD*%
 D12*
 %TO.N,/GND*%
