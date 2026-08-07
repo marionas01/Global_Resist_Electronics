@@ -1,0 +1,4 @@
+(fp_lib_table
+	(version 7)
+	(lib (name "Honeywell_HSC_SMT") (type "KiCad") (uri "${KIPRJMOD}/Honeywell_HSC_SMT.pretty") (options "") (descr ""))
+)
