@@ -1,5 +1,5 @@
 """
-Flowlog-Viewer (PyQt5 + Matplotlib)
+Flowlog-Viewer (PyQt5 + pyqtgraph, reine Qt-Oberfläche)
 
 Funktionen:
   - CSV-Datei laden (Button "CSV laden…" oder als Kommandozeilen-Argument)
@@ -11,8 +11,13 @@ Funktionen:
     (ein-/ausblendbar, folgen der Sichtbarkeit des Kanals)
   - Ymin/Ymax pro Subplot, "Auto Y" für sichtbare Reihen
   - Xmin/Xmax (gemeinsame Zeitachse), "Auto X" für Gesamtzeitraum
-  - Matplotlib-Werkzeugleiste (Zoom, Verschieben, Speichern);
-    Eingabefelder werden beim Zoomen automatisch aktualisiert
+  - Umschalter Zeiteinheit Minuten <-> Stunden (Ausschnitt bleibt erhalten)
+  - Werkzeugleiste (QToolBar): Gesamtansicht, Zoom-Rechteck/Verschieben,
+    als Bild speichern; Mausrad zoomt, Ziehen verschiebt.
+    Eingabefelder werden beim Zoomen automatisch aktualisiert.
+  - Cursor-Koordinaten in der Statusleiste
+
+Benötigt:  pip install PyQt5 pyqtgraph pandas numpy
 
 Start:   python flowlog_gui.py               (leeres Fenster, dann CSV laden)
          python flowlog_gui.py flowlog_054.csv
@@ -24,13 +29,10 @@ import sys
 import numpy as np
 import pandas as pd
 
-from PyQt5 import QtCore, QtWidgets
-from matplotlib.backends.backend_qt5agg import (
-    FigureCanvasQTAgg as FigureCanvas,
-    NavigationToolbar2QT as NavigationToolbar,
-)
-from matplotlib.figure import Figure
-from matplotlib.lines import Line2D
+from PyQt5 import QtCore, QtGui, QtWidgets
+import pyqtgraph as pg
+
+pg.setConfigOptions(background="w", foreground="k", antialias=False)
 
 CHANNELS = [f"ch{i}" for i in range(1, 8)]
 COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
@@ -43,6 +45,13 @@ PLOTS = [
     {"key": "p", "suffix": "_p_mean_mbar",
      "title": "Druck (Mittelwert)", "ylabel": "Druck [mbar]"},
 ]
+
+
+# Zeiteinheiten der x-Achse: Faktor bezogen auf Minuten, Nachkommastellen
+TIME_UNITS = {
+    "min": {"factor": 1.0,      "label": "min", "name": "Minuten", "dec": 1},
+    "h":   {"factor": 1 / 60.0, "label": "h",   "name": "Stunden", "dec": 3},
+}
 
 
 def parse_float(text):
@@ -142,27 +151,77 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, csv_path=None):
         super().__init__()
         self.setWindowTitle("Flowlog-Viewer")
-        self.resize(1500, 900)
 
         self.data = None
-        self.lines = {}      # key -> [Line2D je Kanal]
-        self.air_lines = {}  # key -> [[axvline...] je Kanal]
+        self.lines = {}      # key -> [PlotDataItem je Kanal]
+        self.air_lines = {}  # key -> [[InfiniteLine...] je Kanal]
+        self.ydata = {}      # key -> [numpy-Array je Kanal] (für Auto Y)
+        self.t = None              # Zeitwerte in der aktuell gewählten Einheit
+        self.t_min = None          # Zeitwerte in Minuten (Basis)
+        self.air_times_min = {}    # Kanal -> Beginn air > 0 in Minuten
+        self.time_unit = "min"
 
-        # ---------- Matplotlib-Figur ----------
-        self.fig = Figure(figsize=(12, 8))
-        self.canvas = FigureCanvas(self.fig)
-        self.toolbar = NavigationToolbar(self.canvas, self)
-        ax_flow = self.fig.add_subplot(211)
-        ax_p = self.fig.add_subplot(212, sharex=ax_flow)
-        self.axes = {"flow": ax_flow, "p": ax_p}
-        self.fig.subplots_adjust(left=0.07, right=0.98, top=0.95,
-                                 bottom=0.07, hspace=0.15)
+        # ---------- Plot-Widgets (pyqtgraph.PlotWidget ist ein QWidget) ----------
+        self.plots = {}
+        self.legends = {}
+        for cfg in PLOTS:
+            pw = pg.PlotWidget()
+            pw.setTitle(cfg["title"], size="11pt")
+            pw.setLabel("left", cfg["ylabel"])
+            pw.showGrid(x=True, y=True, alpha=0.3)
+            pw.setDownsampling(auto=True, mode="peak")   # schnell bei vielen Punkten
+            pw.setClipToView(True)
+            pw.hideButtons()                              # eigenes Auto über QPushButtons
+            pw.setMenuEnabled(False)
+            pw.getAxis("left").setWidth(70)   # gleiche Breite -> x-Achsen exakt bündig
+            self.legends[cfg["key"]] = pw.addLegend(offset=(10, 5), colCount=8,
+                                                    labelTextSize="8pt")
+            self.plots[cfg["key"]] = pw
+        self.axes = {k: pw.getPlotItem() for k, pw in self.plots.items()}
 
-        plot_widget = QtWidgets.QWidget()
-        pl = QtWidgets.QVBoxLayout(plot_widget)
-        pl.setContentsMargins(0, 0, 0, 0)
-        pl.addWidget(self.toolbar)
-        pl.addWidget(self.canvas)
+        # Gemeinsame Zeitachse (entspricht sharex)
+        self.plots["p"].setXLink(self.plots["flow"])
+        self.plots["p"].setLabel("bottom", "Zeit [min]")
+        self.plots["flow"].getAxis("bottom").setStyle(showValues=False)
+
+        # Eingabefelder bei Zoom/Pan nachführen
+        for key, pw in self.plots.items():
+            pw.getViewBox().sigRangeChanged.connect(
+                lambda vb, rng, *_, k=key: self.on_range_changed(k, rng))
+            pw.scene().sigMouseMoved.connect(
+                lambda pos, *_, k=key: self.on_mouse_moved(k, pos))
+
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.splitter.addWidget(self.plots["flow"])
+        self.splitter.addWidget(self.plots["p"])
+
+        # ---------- Werkzeugleiste (ersetzt Matplotlib-Toolbar) ----------
+        tb = QtWidgets.QToolBar("Werkzeuge")
+        tb.setMovable(False)
+        style = self.style()
+        act_home = tb.addAction(style.standardIcon(QtWidgets.QStyle.SP_BrowserReload),
+                                "Gesamtansicht")
+        act_home.setToolTip("Gesamtansicht (Auto X + Auto Y)")
+        act_home.triggered.connect(self.reset_view)
+        tb.addSeparator()
+        self.act_pan = tb.addAction("Verschieben")
+        self.act_zoom = tb.addAction("Zoom-Rechteck")
+        mode_group = QtWidgets.QActionGroup(self)
+        for a in (self.act_pan, self.act_zoom):
+            a.setCheckable(True)
+            mode_group.addAction(a)
+        self.act_pan.setChecked(True)
+        self.act_pan.setToolTip("Linke Maustaste ziehen = verschieben, Mausrad = zoomen")
+        self.act_zoom.setToolTip("Linke Maustaste ziehen = Bereich aufziehen und hineinzoomen")
+        mode_group.triggered.connect(self.set_mouse_mode)
+        tb.addSeparator()
+        act_save = tb.addAction(style.standardIcon(QtWidgets.QStyle.SP_DialogSaveButton),
+                                "Als Bild speichern …")
+        act_save.triggered.connect(self.save_image)
+        self.addToolBar(tb)
+        self.statusBar().showMessage("Bereit")
+
+        plot_widget = self.splitter
 
         # ---------- Seitenleiste ----------
         side = QtWidgets.QWidget()
@@ -188,8 +247,17 @@ class MainWindow(QtWidgets.QMainWindow):
             sl.addWidget(ctrl)
 
         # x-Achse
-        xbox = QtWidgets.QGroupBox("Zeitachse [min] (beide Plots)")
+        self.xbox = QtWidgets.QGroupBox()
+        xbox = self.xbox
         xl = QtWidgets.QVBoxLayout(xbox)
+
+        # Umschalter Minuten <-> Stunden
+        self.btn_unit = QtWidgets.QPushButton()
+        self.btn_unit.setCheckable(True)          # gedrückt = Stunden
+        self.btn_unit.setToolTip("Zeitachse zwischen Minuten und Stunden umschalten")
+        self.btn_unit.toggled.connect(
+            lambda checked: self.set_time_unit("h" if checked else "min"))
+        xl.addWidget(self.btn_unit)
         xform = QtWidgets.QFormLayout()
         self.xmin_edit = QtWidgets.QLineEdit()
         self.xmax_edit = QtWidgets.QLineEdit()
@@ -209,7 +277,8 @@ class MainWindow(QtWidgets.QMainWindow):
         sl.addWidget(xbox)
 
         # air-Übersicht
-        airbox = QtWidgets.QGroupBox("Beginn air > 0 [min]")
+        self.airbox = QtWidgets.QGroupBox()
+        airbox = self.airbox
         al = QtWidgets.QVBoxLayout(airbox)
         self.air_text = QtWidgets.QPlainTextEdit()
         self.air_text.setReadOnly(True)
@@ -220,10 +289,22 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         hl = QtWidgets.QHBoxLayout(central)
         hl.addWidget(plot_widget, stretch=1)
-        hl.addWidget(side)
+
+        # Seitenleiste in eine Scroll-Fläche packen: auf kleinen Bildschirmen
+        # (z. B. Laptop mit 768 px Höhe) wird sie scrollbar statt das Fenster
+        # über den Bildschirmrand hinaus zu vergrößern.
+        side_scroll = QtWidgets.QScrollArea()
+        side_scroll.setWidget(side)
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        side_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        side_scroll.setFixedWidth(side.width() + 20)   # Platz für vertikale Scrollleiste
+        hl.addWidget(side_scroll)
         self.setCentralWidget(central)
 
-        self.draw_empty()
+        self.update_unit_labels()
+        self.fit_to_screen()
+
         if csv_path:
             self.load_csv(csv_path)
 
@@ -264,134 +345,220 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # Zeichnen
     # ------------------------------------------------------------------
-    def setup_axes(self):
-        for cfg in PLOTS:
-            ax = self.axes[cfg["key"]]
-            ax.set_title(cfg["title"])
-            ax.set_ylabel(cfg["ylabel"])
-            ax.grid(True)
-        self.axes["p"].set_xlabel("Zeit [min]")
-        self.axes["flow"].tick_params(labelbottom=False)
-
-        # Eingabefelder bei Zoom/Pan nachführen.
-        # (ax.clear() löscht die Callbacks, daher hier jedes Mal neu verbinden)
-        for key, ax in self.axes.items():
-            ax.callbacks.connect("ylim_changed",
-                                 lambda a, k=key: self.controls[k].show_ylim(*a.get_ylim()))
-        self.axes["p"].callbacks.connect("xlim_changed",
-                                         lambda a: self.show_xlim(*a.get_xlim()))
-
-    def draw_empty(self):
-        for ax in self.axes.values():
-            ax.clear()
-        self.setup_axes()
-        self.canvas.draw_idle()
-
     def air_onsets(self, ch):
         air = self.data[f"{ch}_air"] > 0
         start = air & ~air.shift(fill_value=False)
         return self.data.loc[start, "time_min"].to_numpy()
 
     def plot_data(self):
-        t = self.data["time_min"].to_numpy()
-        air_times = {ch: self.air_onsets(ch) for ch in CHANNELS}
-        air_handle = Line2D([], [], color="gray", ls="--", lw=1.2, label="air > 0")
+        f = TIME_UNITS[self.time_unit]["factor"]
+        self.t_min = self.data["time_min"].to_numpy()
+        self.t = self.t_min * f
+        self.air_times_min = {ch: self.air_onsets(ch) for ch in CHANNELS}
+        air_times = {ch: ts * f for ch, ts in self.air_times_min.items()}
 
         for cfg in PLOTS:
-            key, ax = cfg["key"], self.axes[cfg["key"]]
-            ax.clear()
-            self.lines[key] = []
-            self.air_lines[key] = []
+            key, pw = cfg["key"], self.plots[cfg["key"]]
+            pw.clear()
+            legend = self.legends[key]
+            legend.clear()
+            self.lines[key], self.air_lines[key], self.ydata[key] = [], [], []
             for ch, c in zip(CHANNELS, COLORS):
-                (ln,) = ax.plot(t, self.data[f"{ch}{cfg['suffix']}"].to_numpy(),
-                                label=ch, color=c, lw=0.8)
-                self.lines[key].append(ln)
-                self.air_lines[key].append(
-                    [ax.axvline(x, color=c, ls="--", lw=1.2, alpha=0.8)
-                     for x in air_times[ch]])
-            ax.legend(handles=self.lines[key] + [air_handle],
-                      loc="upper left", ncol=8, fontsize=8)
-        self.setup_axes()
+                y = self.data[f"{ch}{cfg['suffix']}"].to_numpy(dtype=float)
+                curve = pw.plot(self.t, y, pen=pg.mkPen(c, width=1), connect="finite")
+                # Legende mit Platzhalter-Eintrag: ein Klick in die Legende soll
+                # nichts am Checkbox-Status vorbei ein-/ausblenden
+                legend.addItem(pg.PlotDataItem(pen=pg.mkPen(c, width=2)), ch)
+                self.lines[key].append(curve)
+                self.ydata[key].append(y)
+                vlines = []
+                for x in air_times[ch]:
+                    vl = pg.InfiniteLine(pos=x, angle=90, movable=False,
+                                         pen=pg.mkPen(c, width=2,
+                                                      style=QtCore.Qt.DashLine))
+                    pw.addItem(vl, ignoreBounds=True)
+                    vlines.append(vl)
+                self.air_lines[key].append(vlines)
+            # Legendeneintrag für die air-Linien
+            dummy = pg.PlotDataItem(pen=pg.mkPen("gray", width=1.5, style=QtCore.Qt.DashLine))
+            legend.addItem(dummy, "air > 0")
 
-        # Übersicht der air-Zeitpunkte
-        txt = []
-        for ch in CHANNELS:
-            ts = air_times[ch]
-            txt.append(f"{ch}: " + (", ".join(f"{x:.1f}" for x in ts) if len(ts) else "–"))
-        self.air_text.setPlainText("\n".join(txt))
+        self.update_air_text()
 
-        for key in self.axes:
-            self.update_visibility(key, redraw=False)
-        self.auto_x(redraw=False)
-        for key in self.axes:
-            self.auto_y(key, redraw=False)
-        self.canvas.draw_idle()
+        for key in self.plots:
+            self.update_visibility(key)
+        self.reset_view()
 
     # ------------------------------------------------------------------
     # Interaktion
     # ------------------------------------------------------------------
-    def update_visibility(self, key, redraw=True):
+    def update_visibility(self, key):
         if key not in self.lines:
             return
         ctrl = self.controls[key]
-        for i, (ln, vlines) in enumerate(zip(self.lines[key], self.air_lines[key])):
+        for i, (curve, vlines) in enumerate(zip(self.lines[key], self.air_lines[key])):
             vis = ctrl.channel_visible(i)
-            ln.set_visible(vis)
+            curve.setVisible(vis)
             for v in vlines:
-                v.set_visible(vis and ctrl.air_visible())
-        if redraw:
-            self.canvas.draw_idle()
+                v.setVisible(vis and ctrl.air_visible())
 
     def set_ylim(self, key, lo, hi):
-        self.axes[key].set_ylim(lo, hi)
-        self.canvas.draw_idle()
+        self.plots[key].setYRange(lo, hi, padding=0)
 
-    def auto_y(self, key, redraw=True):
+    def auto_y(self, key):
         """y-Achse an sichtbare Linien im aktuellen x-Bereich anpassen."""
-        if key not in self.lines:
+        if key not in self.lines or self.t is None:
             return
-        ax = self.axes[key]
-        xmin, xmax = ax.get_xlim()
+        xmin, xmax = self.plots[key].getViewBox().viewRange()[0]
+        xmask = (self.t >= xmin) & (self.t <= xmax)
         ymins, ymaxs = [], []
-        for ln in self.lines[key]:
-            if not ln.get_visible():
+        for curve, y in zip(self.lines[key], self.ydata[key]):
+            if not curve.isVisible():
                 continue
-            x, y = ln.get_xdata(), ln.get_ydata()
-            mask = (x >= xmin) & (x <= xmax) & np.isfinite(y)
-            if mask.any():
-                ymins.append(y[mask].min())
-                ymaxs.append(y[mask].max())
+            yy = y[xmask]
+            yy = yy[np.isfinite(yy)]
+            if yy.size:
+                ymins.append(yy.min())
+                ymaxs.append(yy.max())
         if ymins:
             lo, hi = min(ymins), max(ymaxs)
             pad = 0.05 * (hi - lo) if hi > lo else 1.0
-            ax.set_ylim(lo - pad, hi + pad)
-        if redraw:
-            self.canvas.draw_idle()
+            self.set_ylim(key, lo - pad, hi + pad)
 
     def apply_xlim(self):
         lo, hi = parse_float(self.xmin_edit.text()), parse_float(self.xmax_edit.text())
         if lo is not None and hi is not None and lo < hi:
-            self.axes["p"].set_xlim(lo, hi)   # sharex -> beide Plots
-            self.canvas.draw_idle()
+            self.plots["p"].setXRange(lo, hi, padding=0)   # XLink -> beide Plots
 
-    def auto_x(self, redraw=True):
-        if self.data is None:
+    def auto_x(self):
+        if self.t is None:
             return
-        t = self.data["time_min"]
-        self.axes["p"].set_xlim(t.min(), t.max())
-        if redraw:
-            self.canvas.draw_idle()
+        self.plots["p"].setXRange(np.nanmin(self.t), np.nanmax(self.t), padding=0)
+
+    def reset_view(self):
+        self.auto_x()
+        for key in self.plots:
+            self.auto_y(key)
+
+    # ------------------------------------------------------------------
+    # Fenstergröße an den Bildschirm anpassen
+    # ------------------------------------------------------------------
+    def fit_to_screen(self):
+        """Liest die nutzbare Bildschirmfläche aus (ohne Taskleiste/Dock)
+        und setzt das Fenster genau auf diese Größe."""
+        screen = QtWidgets.QApplication.screenAt(QtGui.QCursor.pos()) \
+            or QtWidgets.QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+
+        # Fensterrahmen/Titelleiste abziehen, damit das Fenster inkl. Rahmen passt
+        frame_w = self.frameGeometry().width() - self.geometry().width()
+        frame_h = self.frameGeometry().height() - self.geometry().height()
+        w = avail.width() - frame_w
+        h = avail.height() - frame_h
+
+        self.resize(w, h)
+        self.move(avail.topLeft())
+
+    # ------------------------------------------------------------------
+    # Zeiteinheit Minuten <-> Stunden
+    # ------------------------------------------------------------------
+    def set_time_unit(self, unit):
+        if unit == self.time_unit:
+            return
+        old_f = TIME_UNITS[self.time_unit]["factor"]
+        new_f = TIME_UNITS[unit]["factor"]
+        # aktuellen Ausschnitt merken (in Minuten), damit er erhalten bleibt
+        x0, x1 = self.plots["p"].getViewBox().viewRange()[0]
+        x0_min, x1_min = x0 / old_f, x1 / old_f
+        y_ranges = {k: pw.getViewBox().viewRange()[1] for k, pw in self.plots.items()}
+
+        self.time_unit = unit
+        self.update_unit_labels()
+
+        if self.t_min is not None:
+            self.t = self.t_min * new_f
+            for key in self.plots:
+                for curve, y in zip(self.lines[key], self.ydata[key]):
+                    curve.setData(self.t, y, connect="finite")
+                for ch, vlines in zip(CHANNELS, self.air_lines[key]):
+                    for vl, x in zip(vlines, self.air_times_min[ch]):
+                        vl.setValue(x * new_f)
+            self.plots["p"].setXRange(x0_min * new_f, x1_min * new_f, padding=0)
+            for key, (y0, y1) in y_ranges.items():
+                self.plots[key].setYRange(y0, y1, padding=0)
+            self.update_air_text()
+        else:
+            self.show_xlim(x0_min * new_f, x1_min * new_f)
+
+    def update_unit_labels(self):
+        u = TIME_UNITS[self.time_unit]
+        other = TIME_UNITS["min" if self.time_unit == "h" else "h"]
+        self.plots["p"].setLabel("bottom", f"Zeit [{u['label']}]")
+        self.xbox.setTitle(f"Zeitachse [{u['label']}] (beide Plots)")
+        self.airbox.setTitle(f"Beginn air > 0 [{u['label']}]")
+        self.btn_unit.setText(f"Einheit: {u['name']}  ⇄  {other['name']}")
+        self.btn_unit.blockSignals(True)
+        self.btn_unit.setChecked(self.time_unit == "h")
+        self.btn_unit.blockSignals(False)
+
+    def update_air_text(self):
+        u = TIME_UNITS[self.time_unit]
+        txt = []
+        for ch in CHANNELS:
+            ts = self.air_times_min.get(ch, [])
+            txt.append(f"{ch}: " + (", ".join(f"{x * u['factor']:.{u['dec']}f}" for x in ts)
+                                    if len(ts) else "–"))
+        self.air_text.setPlainText("\n".join(txt))
 
     def show_xlim(self, lo, hi):
-        self.xmin_edit.setText(f"{lo:.1f}")
-        self.xmax_edit.setText(f"{hi:.1f}")
+        dec = TIME_UNITS[self.time_unit]["dec"]
+        self.xmin_edit.setText(f"{lo:.{dec}f}")
+        self.xmax_edit.setText(f"{hi:.{dec}f}")
+
+    def on_range_changed(self, key, rng):
+        (x0, x1), (y0, y1) = rng
+        self.controls[key].show_ylim(y0, y1)
+        if key == "p":
+            self.show_xlim(x0, x1)
+
+    def on_mouse_moved(self, key, pos):
+        vb = self.plots[key].getViewBox()
+        if vb.sceneBoundingRect().contains(pos):
+            p = vb.mapSceneToView(pos)
+            name = "Flow" if key == "flow" else "Druck"
+            unit = "µl/min" if key == "flow" else "mbar"
+            tu = TIME_UNITS[self.time_unit]
+            self.statusBar().showMessage(
+                f"{name}:  t = {p.x():.{tu['dec'] + 1}f} {tu['label']}   y = {p.y():.4g} {unit}")
+
+    def set_mouse_mode(self, action):
+        mode = pg.ViewBox.RectMode if action is self.act_zoom else pg.ViewBox.PanMode
+        for pw in self.plots.values():
+            pw.getViewBox().setMouseMode(mode)
+
+    def save_image(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Plot als Bild speichern", "flowlog_plot.png",
+            "PNG (*.png);;JPEG (*.jpg);;BMP (*.bmp)")
+        if path:
+            if not self.splitter.grab().save(path):
+                QtWidgets.QMessageBox.warning(self, "Fehler", f"Konnte {path} nicht speichern.")
+            else:
+                self.statusBar().showMessage(f"Gespeichert: {path}", 5000)
 
 
 def main():
+    # Skalierung bei hochauflösenden Bildschirmen (4K, Windows-Skalierung 150 % …)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+
     app = QtWidgets.QApplication(sys.argv)
     csv_path = sys.argv[1] if len(sys.argv) > 1 else None
     win = MainWindow(csv_path)
-    win.show()
+    # Maximiert anzeigen: Fenster füllt den Bildschirm (ohne Taskleiste) exakt aus.
+    # fit_to_screen() in __init__ sorgt dafür, dass auch das "wiederhergestellte"
+    # (nicht maximierte) Fenster nie größer als der Bildschirm ist.
+    win.showMaximized()
     sys.exit(app.exec_())
 
 
